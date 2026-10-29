@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+serviceAccountKey.json
+*.log
+.vscode/
+fcn_resnet50_unet-bcss.pth
