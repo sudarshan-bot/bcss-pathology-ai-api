@@ -1,9 +1,9 @@
 
 import base64
-import datetime
 import io
 import os
 import tempfile
+from datetime import datetime
 
 import numpy as np
 from PIL import Image
@@ -22,13 +22,12 @@ from reportlab.platypus import (
     Image as PDFImage,
     Table,
     TableStyle,
-    KeepTogether,
 )
 
 app = FastAPI(
     title="BCSS Pathology AI API",
-    description="Research prototype for histopathology segmentation and PDF reporting",
-    version="1.1.0",
+    description="Research prototype for histopathology segmentation",
+    version="1.3.0",
 )
 
 CLASS_NAMES = {
@@ -39,14 +38,13 @@ CLASS_NAMES = {
     4: "Others",
 }
 
-# RGB colors for the segmentation overlay
 COLORS = np.array(
     [
-        [255, 0, 0],       # Tumour: red
-        [0, 200, 0],       # Stroma: green
-        [255, 165, 0],     # Inflammatory: orange
-        [160, 32, 240],    # Necrosis: purple
-        [0, 180, 255],     # Others: blue
+        [255, 0, 0],
+        [0, 200, 0],
+        [255, 165, 0],
+        [160, 32, 240],
+        [0, 180, 255],
     ],
     dtype=np.uint8,
 )
@@ -59,7 +57,7 @@ model_error = None
 
 @app.on_event("startup")
 def load_model():
-    """Initialize the TIAToolbox pretrained BCSS model."""
+    """Load TIAToolbox's pretrained BCSS segmentation model."""
     global segmentor, model_error
 
     try:
@@ -70,20 +68,22 @@ def load_model():
         )
         model_error = None
         print("BCSS model initialized successfully.")
+
     except Exception as exc:
         segmentor = None
-        model_error = str(exc)
-        print("Model initialization failed:", repr(exc))
+        model_error = f"{type(exc).__name__}: {exc}"
+        print("Model initialization failed:", model_error)
 
 
 @app.get("/")
 def home():
     return {
         "message": "BCSS Pathology AI API",
-        "docs": "/docs",
         "health": "/health",
+        "docs": "/docs",
         "prediction_endpoint": "/predict",
         "pdf_endpoint": "/predict-report",
+        "notice": "Research prototype, not a clinical diagnosis.",
     }
 
 
@@ -97,25 +97,20 @@ def health():
 
 
 def encode_png(array, mode):
-    """Encode a NumPy image as a Base64 PNG string."""
     buffer = io.BytesIO()
     Image.fromarray(array, mode=mode).save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def run_segmentation(image):
-    """
-    Run the pretrained segmentation model on a PIL RGB image.
-    Returns the mask, colored overlay, and class pixel counts.
-    """
     if segmentor is None:
         raise RuntimeError(
-            f"Model is unavailable: {model_error or 'not initialized'}"
+            f"Model unavailable: {model_error or 'not initialized'}"
         )
 
     original_width, original_height = image.size
 
-    # This pretrained model expects 1024 x 1024 input.
+    # The pretrained model expects 1024 x 1024 input.
     model_image = image.resize(
         (1024, 1024),
         Image.Resampling.BILINEAR,
@@ -133,15 +128,16 @@ def run_segmentation(image):
             batch_size=1,
         )
 
-        pred = np.asarray(output["predictions"][0])
+        prediction = np.asarray(output["predictions"][0])
 
-    pred = np.squeeze(pred)
+    prediction = np.squeeze(prediction)
 
-    if pred.ndim != 2:
-        raise RuntimeError(f"Unexpected prediction shape: {pred.shape}")
+    if prediction.ndim != 2:
+        raise RuntimeError(
+            f"Unexpected prediction shape: {prediction.shape}"
+        )
 
-    # Resize categorical labels using nearest-neighbor interpolation.
-    mask_image = Image.fromarray(pred.astype(np.uint8), mode="L")
+    mask_image = Image.fromarray(prediction.astype(np.uint8), mode="L")
     mask_image = mask_image.resize(
         (original_width, original_height),
         Image.Resampling.NEAREST,
@@ -150,7 +146,6 @@ def run_segmentation(image):
 
     original = np.asarray(image.convert("RGB")).copy()
 
-    # Create a colored mask and blend it with the original image.
     valid = (mask >= 0) & (mask < len(COLORS))
     colored_mask = np.zeros_like(original)
     colored_mask[valid] = COLORS[mask[valid]]
@@ -160,232 +155,28 @@ def run_segmentation(image):
         0.55 * original[valid] + 0.45 * colored_mask[valid]
     ).astype(np.uint8)
 
-    class_counts = {
-        CLASS_NAMES[class_id]: int(np.count_nonzero(mask == class_id))
-        for class_id in CLASS_NAMES
+    pixel_counts = {
+        name: int(np.count_nonzero(mask == class_id))
+        for class_id, name in CLASS_NAMES.items()
     }
 
-    return mask, overlay, class_counts
-
-
-def create_pdf_report(
-    original_bytes,
-    original_image,
-    mask,
-    overlay,
-    class_counts,
-    filename,
-):
-    """Build the PDF report in memory and return its bytes."""
-    pdf_buffer = io.BytesIO()
-
-    document = SimpleDocTemplate(
-        pdf_buffer,
-        pagesize=A4,
-        rightMargin=16 * mm,
-        leftMargin=16 * mm,
-        topMargin=15 * mm,
-        bottomMargin=15 * mm,
-        title="BCSS Pathology AI Research Report",
-        author="BCSS Pathology AI API",
-    )
-
-    styles = getSampleStyleSheet()
-    story = []
-
-    width, height = original_image.size
-    generated_at = datetime.datetime.now().astimezone().strftime(
-        "%Y-%m-%d %H:%M:%S %Z"
-    )
-
-    story.append(Paragraph("BCSS Pathology AI Report", styles["Title"]))
-    story.append(Spacer(1, 3 * mm))
-    story.append(
-        Paragraph(
-            "Research prototype — not a clinical diagnosis",
-            styles["Heading2"],
-        )
-    )
-    story.append(Paragraph(f"Filename: {filename}", styles["Normal"]))
-    story.append(
-        Paragraph(
-            f"Original image dimensions: {width} × {height} pixels",
-            styles["Normal"],
-        )
-    )
-    story.append(Paragraph(f"Report generated: {generated_at}", styles["Normal"]))
-    story.append(Spacer(1, 5 * mm))
-
-    # Original uploaded image
-    original_buffer = io.BytesIO(original_bytes)
-    story.append(Paragraph("1. Original Pathology Image", styles["Heading2"]))
-    story.append(
-        PDFImage(
-            original_buffer,
-            width=170 * mm,
-            height=115 * mm,
-            kind="proportional",
-        )
-    )
-    story.append(Spacer(1, 5 * mm))
-
-    # Colored segmentation overlay
-    overlay_buffer = io.BytesIO()
-    Image.fromarray(overlay, mode="RGB").save(overlay_buffer, format="PNG")
-    overlay_buffer.seek(0)
-
-    story.append(Paragraph("2. Segmentation Overlay", styles["Heading2"]))
-    story.append(
-        PDFImage(
-            overlay_buffer,
-            width=170 * mm,
-            height=115 * mm,
-            kind="proportional",
-        )
-    )
-    story.append(Spacer(1, 4 * mm))
-
-    # Predicted categorical mask
-    mask_buffer = io.BytesIO()
-    Image.fromarray(mask.astype(np.uint8), mode="L").save(
-        mask_buffer, format="PNG"
-    )
-    mask_buffer.seek(0)
-
-    story.append(Paragraph("3. Predicted Segmentation Mask", styles["Heading2"]))
-    story.append(
-        Paragraph(
-            "The mask stores the predicted class ID for each pixel. "
-            "The color legend below describes the overlay colors.",
-            styles["Normal"],
-        )
-    )
-    story.append(Spacer(1, 2 * mm))
-    story.append(
-        PDFImage(
-            mask_buffer,
-            width=170 * mm,
-            height=115 * mm,
-            kind="proportional",
-        )
-    )
-    story.append(Spacer(1, 4 * mm))
-
-    # Class legend
-    story.append(Paragraph("4. Class Legend", styles["Heading2"]))
-
-    legend_data = [["Class ID", "Class", "Overlay color"]]
-    color_names = ["Red", "Green", "Orange", "Purple", "Blue"]
-
-    for class_id, class_name in CLASS_NAMES.items():
-        legend_data.append([str(class_id), class_name, color_names[class_id]])
-
-    legend_table = Table(
-        legend_data,
-        colWidths=[25 * mm, 70 * mm, 55 * mm],
-        repeatRows=1,
-    )
-    legend_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#243B53")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("PADDING", (0, 0), (-1, -1), 6),
-                (
-                    "ROWBACKGROUNDS",
-                    (0, 1),
-                    (-1, -1),
-                    [colors.white, colors.HexColor("#F0F4F8")],
-                ),
-            ]
-        )
-    )
-    story.append(legend_table)
-    story.append(Spacer(1, 5 * mm))
-
-    # Pixel counts and percentages
-    story.append(Paragraph("5. Predicted Class Statistics", styles["Heading2"]))
-
-    total_pixels = width * height
-    table_data = [["Class", "Pixel count", "Image percentage"]]
-
-    for class_name, count in class_counts.items():
-        percentage = (
-            (count / total_pixels) * 100 if total_pixels else 0
-        )
-        table_data.append(
-            [class_name, f"{count:,}", f"{percentage:.2f}%"]
-        )
-
-    stats_table = Table(
-        table_data,
-        colWidths=[60 * mm, 45 * mm, 50 * mm],
-        repeatRows=1,
-    )
-    stats_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#243B53")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("PADDING", (0, 0), (-1, -1), 6),
-                (
-                    "ROWBACKGROUNDS",
-                    (0, 1),
-                    (-1, -1),
-                    [colors.white, colors.HexColor("#F0F4F8")],
-                ),
-            ]
-        )
-    )
-    story.append(stats_table)
-    story.append(Spacer(1, 5 * mm))
-
-    # Measurement limitations
-    story.append(Paragraph("6. Measurement Notes", styles["Heading2"]))
-    story.append(
-        Paragraph(
-            f"Image dimensions: {width} × {height} pixels. "
-            "Pixel counts describe model-predicted labels. This report does "
-            "not calculate verified individual tumor-region boundaries, "
-            "lengths, widths, or perimeters. Such measurements require a "
-            "separate region-analysis procedure. Physical dimensions in "
-            "micrometers or millimeters cannot be calculated without a "
-            "reliable image scale or microscope calibration.",
-            styles["BodyText"],
-        )
-    )
-    story.append(Spacer(1, 4 * mm))
-
-    story.append(Paragraph("7. Research Disclaimer", styles["Heading2"]))
-    story.append(
-        Paragraph(
-            "This report presents experimental outputs from a pretrained "
-            "semantic segmentation model. Predicted classes are not confirmed "
-            "diagnoses. Model performance, class mapping, and suitability "
-            "for clinical use have not been established by this API. Do not "
-            "use this report as a standalone diagnostic tool; interpretation "
-            "requires a qualified pathologist.",
-            styles["BodyText"],
-        )
-    )
-
-    document.build(story)
-    result = pdf_buffer.getvalue()
-    pdf_buffer.close()
-    return result
+    return mask, overlay, pixel_counts
 
 
 async def read_uploaded_image(file: UploadFile):
-    """Read and validate an uploaded image once."""
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
-            detail="Upload a valid image file.",
+            detail="Please upload an image file.",
         )
 
     contents = await file.read()
+
+    if not contents:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty.",
+        )
 
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(
@@ -393,16 +184,13 @@ async def read_uploaded_image(file: UploadFile):
             detail="Image must be 20 MB or smaller.",
         )
 
-    if not contents:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
         image.load()
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is not a valid image.",
+            detail="Invalid image file.",
         )
     finally:
         await file.close()
@@ -412,31 +200,31 @@ async def read_uploaded_image(file: UploadFile):
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    """Return segmentation results as JSON with Base64 PNG images."""
     if segmentor is None:
         raise HTTPException(
             status_code=503,
-            detail=f"Model is not available: {model_error or 'not initialized'}",
+            detail=f"Model unavailable: {model_error or 'not initialized'}",
         )
 
     _, image = await read_uploaded_image(file)
 
     try:
-        mask, overlay, class_counts = run_segmentation(image)
+        mask, overlay, pixel_counts = run_segmentation(image)
 
         return {
             "filename": file.filename,
             "image_width": image.width,
             "image_height": image.height,
             "class_names": CLASS_NAMES,
-            "pixel_counts": class_counts,
+            "pixel_counts": pixel_counts,
             "mask_png_base64": encode_png(mask, "L"),
             "overlay_png_base64": encode_png(overlay, "RGB"),
             "notice": (
-                "Research prototype only. Results are not clinically "
-                "validated and must not be used as a standalone diagnosis."
+                "Research output only. Predictions are not clinically "
+                "validated and are not a standalone diagnosis."
             ),
         }
+
     except HTTPException:
         raise
     except Exception as exc:
@@ -447,43 +235,155 @@ async def predict(file: UploadFile = File(...)):
         )
 
 
+def create_pdf_report(original_bytes, image, mask, overlay, pixel_counts, filename):
+    pdf_buffer = io.BytesIO()
+
+    document = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph("BCSS Pathology AI Report", styles["Title"]),
+        Spacer(1, 4 * mm),
+        Paragraph(
+            "Research prototype — not a clinical diagnosis",
+            styles["Heading2"],
+        ),
+        Paragraph(f"Filename: {filename}", styles["Normal"]),
+        Paragraph(
+            f"Image size: {image.width} x {image.height} pixels",
+            styles["Normal"],
+        ),
+        Paragraph(
+            f"Generated: {datetime.now().astimezone().isoformat()}",
+            styles["Normal"],
+        ),
+        Spacer(1, 5 * mm),
+        Paragraph("Original Image", styles["Heading2"]),
+    ]
+
+    original_buffer = io.BytesIO(original_bytes)
+    story.append(
+        PDFImage(
+            original_buffer,
+            width=170 * mm,
+            height=110 * mm,
+            kind="proportional",
+        )
+    )
+
+    overlay_buffer = io.BytesIO()
+    Image.fromarray(overlay).save(overlay_buffer, format="PNG")
+    overlay_buffer.seek(0)
+
+    story.append(Spacer(1, 4 * mm))
+    story.append(Paragraph("Segmentation Overlay", styles["Heading2"]))
+    story.append(
+        PDFImage(
+            overlay_buffer,
+            width=170 * mm,
+            height=110 * mm,
+            kind="proportional",
+        )
+    )
+
+    mask_buffer = io.BytesIO()
+    Image.fromarray(mask.astype(np.uint8), mode="L").save(
+        mask_buffer, format="PNG"
+    )
+    mask_buffer.seek(0)
+
+    story.append(Spacer(1, 4 * mm))
+    story.append(Paragraph("Predicted Mask", styles["Heading2"]))
+    story.append(
+        PDFImage(
+            mask_buffer,
+            width=170 * mm,
+            height=110 * mm,
+            kind="proportional",
+        )
+    )
+
+    table_data = [["Class", "Pixel count"]]
+    for name, count in pixel_counts.items():
+        table_data.append([name, f"{count:,}"])
+
+    table = Table(table_data, colWidths=[80 * mm, 60 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#243B53")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("PADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+
+    story.extend(
+        [
+            Spacer(1, 5 * mm),
+            Paragraph("Predicted Class Statistics", styles["Heading2"]),
+            table,
+            Spacer(1, 5 * mm),
+            Paragraph(
+                "These are experimental segmentation results. They have "
+                "not been clinically validated. Pixel counts are not "
+                "physical measurements. A qualified pathologist must "
+                "interpret the images.",
+                styles["BodyText"],
+            ),
+        ]
+    )
+
+    document.build(story)
+    result = pdf_buffer.getvalue()
+    pdf_buffer.close()
+    return result
+
+
 @app.post("/predict-report")
 async def predict_report(file: UploadFile = File(...)):
-    """Run segmentation and return a downloadable PDF report."""
     if segmentor is None:
         raise HTTPException(
             status_code=503,
-            detail=f"Model is not available: {model_error or 'not initialized'}",
+            detail=f"Model unavailable: {model_error or 'not initialized'}",
         )
 
     original_bytes, image = await read_uploaded_image(file)
 
     try:
-        mask, overlay, class_counts = run_segmentation(image)
+        mask, overlay, pixel_counts = run_segmentation(image)
 
         pdf_bytes = create_pdf_report(
-            original_bytes=original_bytes,
-            original_image=image,
-            mask=mask,
-            overlay=overlay,
-            class_counts=class_counts,
-            filename=file.filename or "uploaded_image",
+            original_bytes,
+            image,
+            mask,
+            overlay,
+            pixel_counts,
+            file.filename or "uploaded_image",
         )
-
-        safe_filename = "bcss_pathology_report.pdf"
 
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
             headers={
-                "Content-Disposition": f'attachment; filename="{safe_filename}"'
+                "Content-Disposition":
+                    'attachment; filename="bcss_pathology_report.pdf"'
             },
         )
+
     except HTTPException:
         raise
     except Exception as exc:
-        print("PDF report generation failed:", repr(exc))
+        print("PDF report failed:", repr(exc))
         raise HTTPException(
             status_code=500,
-            detail=f"Could not generate PDF report: {str(exc)}",
+            detail=f"Could not generate PDF: {str(exc)}",
         )
